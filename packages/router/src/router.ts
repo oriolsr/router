@@ -44,7 +44,14 @@ import {
   stringifyQuery as originalStringifyQuery,
   LocationQuery,
 } from './query'
-import { shallowRef, nextTick, App, unref, shallowReactive } from 'vue'
+import {
+  shallowRef,
+  nextTick,
+  App,
+  unref,
+  shallowReactive,
+  computed,
+} from 'vue'
 import { RouteRecordNormalized } from './matcher/types'
 import {
   parseURL,
@@ -56,6 +63,8 @@ import {
   extractChangingRecords,
   extractComponentsGuards,
   guardToPromiseFn,
+  guardToPromiseFnWithLayers,
+  loadRouteLocation,
 } from './navigationGuards'
 import { warn } from './warning'
 import { RouterLink } from './RouterLink'
@@ -64,6 +73,8 @@ import {
   routeLocationKey,
   routerKey,
   routerViewLocationKey,
+  routerLayerKey,
+  routerRoutesKey,
 } from './injectionSymbols'
 import { addDevtools } from './devtools'
 import { _LiteralUnion } from './types/utils'
@@ -122,6 +133,65 @@ export interface Router
    * Delete all routes from the router.
    */
   clearRoutes(): void
+
+  /**
+   * Add a new layer and navigate to it.
+   */
+  pushAddLayer(
+    to: RouteLocationRaw
+  ): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Add a new layer and replace current navigation.
+   */
+  replaceAddLayer(
+    to: RouteLocationRaw
+  ): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Remove the last layer.
+   */
+  pushRemoveLayer(): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Remove the last layer and replace current navigation.
+   */
+  replaceRemoveLayer(): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Navigate a specific layer.
+   */
+  pushLayer(
+    layer: number,
+    to: RouteLocationRaw
+  ): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Navigate a specific layer and replace current navigation.
+   */
+  replaceLayer(
+    layer: number,
+    to: RouteLocationRaw
+  ): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Navigate all layers at once.
+   */
+  pushAllLayers(
+    locations: RouteLocationRaw[]
+  ): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Navigate all layers at once and replace current navigation.
+   */
+  replaceAllLayers(
+    locations: RouteLocationRaw[]
+  ): Promise<NavigationFailure | void | undefined>
+
+  /**
+   * Current routes (layers) array. Used internally by RouterView to access routes for different layers.
+   */
+  readonly currentRoutes: RouteLocationNormalizedLoaded[]
 }
 
 /**
@@ -143,10 +213,15 @@ export function createRouter(options: RouterOptions): Router {
   const beforeGuards = useCallbacks<NavigationGuardWithThis<undefined>>()
   const beforeResolveGuards = useCallbacks<NavigationGuardWithThis<undefined>>()
   const afterGuards = useCallbacks<NavigationHookAfter>()
-  const currentRoute = shallowRef<RouteLocationNormalizedLoaded>(
-    START_LOCATION_NORMALIZED
+  // Support multiple layers: store routes as an array
+  const currentRoutes = shallowRef<RouteLocationNormalizedLoaded[]>([
+    START_LOCATION_NORMALIZED,
+  ])
+  // Keep currentRoute for backward compatibility (returns last layer)
+  const currentRoute = computed(
+    () => currentRoutes.value[currentRoutes.value.length - 1]
   )
-  let pendingLocation: RouteLocation = START_LOCATION_NORMALIZED
+  let pendingLocations: RouteLocation[] = [START_LOCATION_NORMALIZED]
 
   // leave the scrollRestoration if no scrollBehavior is provided
   if (isBrowser && options.scrollBehavior && 'scrollRestoration' in history) {
@@ -357,7 +432,20 @@ export function createRouter(options: RouterOptions): Router {
     to: RouteLocationNormalized,
     from: RouteLocationNormalized
   ): NavigationFailure | void {
-    if (pendingLocation !== to) {
+    // Check if navigation was canceled by comparing with pending locations
+    const lastPending = pendingLocations[pendingLocations.length - 1]
+    if (__DEV__)
+      console.log('[Router] checkCanceledNavigation', {
+        lastPending: lastPending?.fullPath,
+        to: to.fullPath,
+        pendingLocations: pendingLocations.map(l => l.fullPath),
+      })
+    if (lastPending !== to) {
+      if (__DEV__)
+        console.warn(
+          '[Router] Navigation cancelled - pending location mismatch',
+          { lastPending: lastPending?.fullPath, to: to.fullPath }
+        )
       return createRouterError<NavigationFailure>(
         ErrorTypes.NAVIGATION_CANCELLED,
         {
@@ -374,6 +462,123 @@ export function createRouter(options: RouterOptions): Router {
 
   function replace(to: RouteLocationRaw) {
     return push(assign(locationAsObject(to), { replace: true }))
+  }
+
+  // Layer navigation methods
+  function pushAddLayer(to: RouteLocationRaw) {
+    const newLocations = [
+      ...currentRoutes.value.map(r => r.fullPath),
+      resolve(to).fullPath,
+    ]
+    return navigateAllLayers(newLocations, true)
+  }
+
+  function replaceAddLayer(to: RouteLocationRaw) {
+    const newLocations = [
+      ...currentRoutes.value.map(r => r.fullPath),
+      resolve(to).fullPath,
+    ]
+    return navigateAllLayers(newLocations, false)
+  }
+
+  function pushRemoveLayer() {
+    if (currentRoutes.value.length <= 1) {
+      return Promise.resolve()
+    }
+    const newLocations = currentRoutes.value.slice(0, -1).map(r => r.fullPath)
+    return navigateAllLayers(newLocations, true)
+  }
+
+  function replaceRemoveLayer() {
+    if (currentRoutes.value.length <= 1) {
+      return Promise.resolve()
+    }
+    const newLocations = currentRoutes.value.slice(0, -1).map(r => r.fullPath)
+    return navigateAllLayers(newLocations, false)
+  }
+
+  function pushLayer(layer: number, to: RouteLocationRaw) {
+    const newLocations = [
+      ...currentRoutes.value.slice(0, layer).map(r => r.fullPath),
+      resolve(to).fullPath,
+      ...currentRoutes.value.slice(layer + 1).map(r => r.fullPath),
+    ]
+    return navigateAllLayers(newLocations, true)
+  }
+
+  function replaceLayer(layer: number, to: RouteLocationRaw) {
+    const newLocations = [
+      ...currentRoutes.value.slice(0, layer).map(r => r.fullPath),
+      resolve(to).fullPath,
+      ...currentRoutes.value.slice(layer + 1).map(r => r.fullPath),
+    ]
+    return navigateAllLayers(newLocations, false)
+  }
+
+  function pushAllLayers(locations: RouteLocationRaw[]) {
+    const newLocations = locations.map(loc => resolve(loc).fullPath)
+    return navigateAllLayers(newLocations, true)
+  }
+
+  function replaceAllLayers(locations: RouteLocationRaw[]) {
+    const newLocations = locations.map(loc => resolve(loc).fullPath)
+    return navigateAllLayers(newLocations, false)
+  }
+
+  function navigateAllLayers(
+    locations: string[],
+    push: boolean
+  ): Promise<NavigationFailure | void | undefined> {
+    if (locations.length === 0) {
+      return Promise.resolve()
+    }
+
+    // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
+    // Take only the last 2 locations if more are provided
+    const limitedLocations = locations.slice(-2)
+
+    // Resolve all locations
+    const resolvedLocations = limitedLocations.map((loc, index) => {
+      const current =
+        index < currentRoutes.value.length
+          ? currentRoutes.value[index]
+          : currentRoute.value
+      return resolve(loc, current) as RouteLocationNormalized
+    })
+
+    // IMPORTANT: Ensure we don't have duplicate routes in the layers
+    // If we have 2 layers and they resolve to the same route, keep only one
+    if (resolvedLocations.length === 2) {
+      const [first, second] = resolvedLocations
+      // If both routes have the same fullPath, they're duplicates
+      // In this case, keep only the second (modal) route as a single layer
+      if (first.fullPath === second.fullPath) {
+        resolvedLocations.splice(0, 1)
+      }
+    }
+
+    // Navigate to the last layer (which will update the URL)
+    const lastLocation = resolvedLocations[resolvedLocations.length - 1]
+    // IMPORTANT: Ensure pendingLocations doesn't exceed 2 layers
+    pendingLocations = resolvedLocations
+
+    // Create a location object with replace flag if needed
+    const locationOptions: RouteLocationOptions = push ? {} : { replace: true }
+
+    return pushWithRedirect(
+      assign(locationAsObject(lastLocation), locationOptions)
+    ).then(failure => {
+      if (failure) {
+        return failure
+      }
+      // Update all layers after successful navigation
+      // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
+      const loadedLocations = resolvedLocations
+        .slice(-2)
+        .map(loc => resolve(loc.fullPath) as RouteLocationNormalizedLoaded)
+      currentRoutes.value = loadedLocations
+      return undefined
+    })
   }
 
   function handleRedirectRecord(
@@ -430,7 +635,18 @@ export function createRouter(options: RouterOptions): Router {
     to: RouteLocationRaw | RouteLocation,
     redirectedFrom?: RouteLocation
   ): Promise<NavigationFailure | void | undefined> {
-    const targetLocation: RouteLocation = (pendingLocation = resolve(to))
+    const targetLocation: RouteLocation = resolve(to)
+    // Preserve pendingLocations if it already has multiple entries (set by navigateAllLayers)
+    // This is important for redirects - we want to maintain the multi-layer structure
+    const hadMultipleLayers = pendingLocations.length > 1
+    if (hadMultipleLayers) {
+      // Update the last entry to the new target (in case of redirects)
+      // This preserves the multi-layer structure through redirects
+      pendingLocations[pendingLocations.length - 1] = targetLocation
+    } else {
+      // Only reset to single location if we didn't have multiple layers
+      pendingLocations = [targetLocation]
+    }
     const from = currentRoute.value
     const data: HistoryState | undefined = (to as RouteLocationOptions).state
     const force: boolean | undefined = (to as RouteLocationOptions).force
@@ -439,7 +655,10 @@ export function createRouter(options: RouterOptions): Router {
 
     const shouldRedirect = handleRedirectRecord(targetLocation, from)
 
-    if (shouldRedirect)
+    if (shouldRedirect) {
+      // When redirecting, pushWithRedirect will be called recursively
+      // Since we've already updated pendingLocations above (preserving multi-layer if it existed),
+      // the recursive call will also preserve it because hadMultipleLayers will still be true
       return pushWithRedirect(
         assign(locationAsObject(shouldRedirect), {
           state:
@@ -452,6 +671,7 @@ export function createRouter(options: RouterOptions): Router {
         // keep original redirectedFrom if it exists
         redirectedFrom || targetLocation
       )
+    }
 
     // if it was a redirect we already called `pushWithRedirect` above
     const toLocation = targetLocation as RouteLocationNormalized
@@ -538,9 +758,26 @@ export function createRouter(options: RouterOptions): Router {
           }
         } else {
           // if we fail we don't finalize the navigation
+          // Construct all layers: use pendingLocations (which now have resolved components)
+          // pendingLocations was updated in the previous step to have all components resolved
+          const toLocations: RouteLocationNormalizedLoaded[] =
+            pendingLocations.length > 1
+              ? pendingLocations.map((loc, index) => {
+                  // For the last layer, use toLocation (has resolved components from navigation)
+                  if (index === pendingLocations.length - 1) {
+                    return toLocation as RouteLocationNormalizedLoaded
+                  }
+                  // For other layers, use the loaded location from pendingLocations (components already resolved)
+                  return loc as RouteLocationNormalizedLoaded
+                })
+              : [toLocation as RouteLocationNormalizedLoaded]
+
+          const fromLocations: RouteLocationNormalizedLoaded[] =
+            currentRoutes.value.length > 1 ? currentRoutes.value : [from]
+
           failure = finalizeNavigation(
-            toLocation as RouteLocationNormalizedLoaded,
-            from,
+            toLocations,
+            fromLocations,
             true,
             replace,
             data
@@ -571,6 +808,8 @@ export function createRouter(options: RouterOptions): Router {
   function runWithContext<T>(fn: () => T): T {
     const app: App | undefined = installedApps.values().next().value
     // support Vue < 3.3
+    // Note: app.runWithContext() provides app context but inject() requires component setup context
+    // If guards use inject(), they will trigger a warning but navigation will still work
     return app && typeof app.runWithContext === 'function'
       ? app.runWithContext(fn)
       : fn()
@@ -611,16 +850,74 @@ export function createRouter(options: RouterOptions): Router {
     guards.push(canceledNavigationCheck)
 
     // run the queue of per route beforeRouteLeave guards
+    if (__DEV__)
+      console.log('[Router] Running beforeRouteLeave guards', {
+        guardsCount: guards.length,
+      })
     return (
       runGuardQueue(guards)
         .then(() => {
+          if (__DEV__)
+            console.log(
+              '[Router] beforeRouteLeave guards completed, moving to beforeEach'
+            )
           // check global guards beforeEach
+          // Pass arrays of routes (layers) to match router-legacy behavior
           guards = []
-          for (const guard of beforeGuards.list()) {
-            guards.push(guardToPromiseFn(guard, to, from))
+          // Build toRoutes array: use pendingLocations if it has multiple entries (multi-layer navigation),
+          // otherwise construct array with single 'to' route
+          // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
+          let toRoutes: RouteLocationNormalized[] =
+            pendingLocations.length > 1
+              ? pendingLocations.slice(-2).map(loc => {
+                  // pendingLocations may contain RouteLocation or RouteLocationNormalized
+                  // Ensure all are normalized
+                  if ('matched' in loc && loc.matched) {
+                    // Already normalized
+                    return loc as RouteLocationNormalized
+                  }
+                  // Need to normalize
+                  return resolve(
+                    loc.fullPath || loc.path || ''
+                  ) as RouteLocationNormalized
+                })
+              : [to]
+
+          // IMPORTANT: Remove duplicates from toRoutes
+          // If we have 2 routes with the same fullPath, keep only one (the last one)
+          if (toRoutes.length === 2) {
+            const [first, second] = toRoutes
+            if (first.fullPath === second.fullPath) {
+              toRoutes = [second] // Keep only the last (modal) route
+            }
+          }
+          // Use currentRoutes for 'from' (array of current routes/layers)
+          // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
+          const fromRoutes = currentRoutes.value.slice(-2)
+
+          const beforeGuardsList = beforeGuards.list()
+          if (__DEV__)
+            console.log('[Router] beforeEach guards to execute', {
+              count: beforeGuardsList.length,
+              toRoutes: toRoutes.map(r => r.fullPath),
+              fromRoutes: fromRoutes.map(r => r.fullPath),
+            })
+          for (const guard of beforeGuardsList) {
+            guards.push(
+              guardToPromiseFnWithLayers(
+                guard,
+                toRoutes,
+                fromRoutes,
+                runWithContext
+              )
+            )
           }
           guards.push(canceledNavigationCheck)
 
+          if (__DEV__)
+            console.log('[Router] Running beforeEach guard queue', {
+              guardsCount: guards.length,
+            })
           return runGuardQueue(guards)
         })
         .then(() => {
@@ -663,22 +960,68 @@ export function createRouter(options: RouterOptions): Router {
         })
         .then(() => {
           // NOTE: at this point to.matched is normalized and does not contain any () => Promise<Component>
+          // But for multi-layer navigation, we need to ensure ALL layers have resolved components
+          // Load all pending locations to ensure their components are resolved
+          if (pendingLocations.length > 1) {
+            // Load all layers' components before proceeding
+            const loadPromises = pendingLocations.map(loc => {
+              // If it's already a RouteLocationNormalized with resolved components, use it
+              if ('matched' in loc && loc.matched && loc.matched.length > 0) {
+                // Check if components are already resolved (not functions)
+                const hasUnresolvedComponents = loc.matched.some(
+                  record =>
+                    record.components &&
+                    Object.values(record.components).some(
+                      comp =>
+                        typeof comp === 'function' && !('displayName' in comp)
+                    )
+                )
+                if (!hasUnresolvedComponents) {
+                  return Promise.resolve(loc as RouteLocationNormalizedLoaded)
+                }
+              }
+              // Otherwise, load the route location to resolve async components
+              return loadRouteLocation(loc)
+            })
+            return Promise.all(loadPromises).then(loadedLocations => {
+              // Update pendingLocations with loaded locations (components resolved)
+              // Type assertion: loadedLocations are now RouteLocationNormalizedLoaded[]
+              pendingLocations = loadedLocations as any
+              // Continue with beforeRouteEnter guards
+              // clear existing enterCallbacks, these are added by extractComponentsGuards
+              to.matched.forEach(record => (record.enterCallbacks = {}))
 
-          // clear existing enterCallbacks, these are added by extractComponentsGuards
-          to.matched.forEach(record => (record.enterCallbacks = {}))
+              // check in-component beforeRouteEnter
+              guards = extractComponentsGuards(
+                enteringRecords,
+                'beforeRouteEnter',
+                to,
+                from,
+                runWithContext
+              )
+              guards.push(canceledNavigationCheck)
 
-          // check in-component beforeRouteEnter
-          guards = extractComponentsGuards(
-            enteringRecords,
-            'beforeRouteEnter',
-            to,
-            from,
-            runWithContext
-          )
-          guards.push(canceledNavigationCheck)
+              // run the queue of per route beforeEnter guards
+              return runGuardQueue(guards)
+            })
+          } else {
+            // Single layer navigation - components already resolved
+            // clear existing enterCallbacks, these are added by extractComponentsGuards
+            to.matched.forEach(record => (record.enterCallbacks = {}))
 
-          // run the queue of per route beforeEnter guards
-          return runGuardQueue(guards)
+            // check in-component beforeRouteEnter
+            guards = extractComponentsGuards(
+              enteringRecords,
+              'beforeRouteEnter',
+              to,
+              from,
+              runWithContext
+            )
+            guards.push(canceledNavigationCheck)
+
+            // run the queue of per route beforeEnter guards
+            return runGuardQueue(guards)
+          }
         })
         .then(() => {
           // check global guards beforeResolve
@@ -717,12 +1060,15 @@ export function createRouter(options: RouterOptions): Router {
    * - Calls the scrollBehavior
    */
   function finalizeNavigation(
-    toLocation: RouteLocationNormalizedLoaded,
-    from: RouteLocationNormalizedLoaded,
+    toLocations: RouteLocationNormalizedLoaded[],
+    fromLocations: RouteLocationNormalizedLoaded[],
     isPush: boolean,
     replace?: boolean,
     data?: HistoryState
   ): NavigationFailure | void {
+    const toLocation = toLocations[toLocations.length - 1]
+    const from = fromLocations[fromLocations.length - 1]
+
     // a more recent navigation took place
     const error = checkCanceledNavigation(toLocation, from)
     if (error) return error
@@ -734,6 +1080,9 @@ export function createRouter(options: RouterOptions): Router {
     // change URL only if the user did a push/replace and if it's not the initial navigation because
     // it's just reflecting the url
     if (isPush) {
+      // Prepare layers array from all locations (matching router-legacy: state.state)
+      const layers = toLocations.map(loc => loc.fullPath)
+
       // on the initial navigation, we want to reuse the scroll position from
       // history state if it exists
       if (replace || isFirstNavigation)
@@ -742,15 +1091,51 @@ export function createRouter(options: RouterOptions): Router {
           assign(
             {
               scroll: isFirstNavigation && state && state.scroll,
+              state: layers, // Match router-legacy structure
             },
             data
           )
         )
-      else routerHistory.push(toLocation.fullPath, data)
+      else
+        routerHistory.push(toLocation.fullPath, assign({ state: layers }, data))
     }
 
-    // accept current navigation
-    currentRoute.value = toLocation
+    // accept current navigation - update all layers
+    // Use toLocations (which has resolved components) when available
+    // If pendingLocations has multiple entries and toLocations matches, use toLocations
+    // Otherwise construct from pendingLocations but ensure components are resolved
+    // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
+    // IMPORTANT: If toLocations has only one entry, we should only have one layer in currentRoutes
+    // to prevent non-modal routes from being rendered in next-layer
+    if (toLocations.length === 1) {
+      // Single route navigation - always use single layer
+      currentRoutes.value = toLocations
+    } else if (
+      pendingLocations.length > 1 &&
+      toLocations.length === pendingLocations.length
+    ) {
+      // Multiple layers navigation - use toLocations which has resolved components
+      // Limit to max 2 layers (take last 2)
+      currentRoutes.value = toLocations.slice(-2)
+    } else if (pendingLocations.length > 1) {
+      // Fallback: Convert pendingLocations to loaded locations
+      // This should rarely happen, but ensures we have the right number of layers
+      // Limit to max 2 layers (take last 2)
+      const loadedLocations = pendingLocations.slice(-2).map((loc, index) => {
+        // Prefer toLocations[index] if available (has resolved components)
+        // Adjust index to account for slice(-2)
+        const toLocationsIndex = toLocations.length - 2 + index
+        if (toLocationsIndex >= 0 && toLocationsIndex < toLocations.length) {
+          return toLocations[toLocationsIndex]
+        }
+        // Otherwise resolve the location (components should be resolved by now)
+        return resolve(loc.fullPath) as RouteLocationNormalizedLoaded
+      })
+      currentRoutes.value = loadedLocations
+    } else {
+      // Single layer - limit to 1
+      currentRoutes.value = toLocations.slice(-1)
+    }
     handleScroll(toLocation, from, isPush, isFirstNavigation)
 
     markAsReady()
@@ -762,7 +1147,13 @@ export function createRouter(options: RouterOptions): Router {
     // avoid setting up listeners twice due to an invalid first navigation
     if (removeHistoryListener) return
     removeHistoryListener = routerHistory.listen((to, _from, info) => {
-      if (!router.listening) return
+      if (!router.listening) {
+        if (__DEV__)
+          console.warn(
+            '[Router] History listener called but router.listening is false'
+          )
+        return
+      }
       // cannot be a redirect route because it was in history
       const toLocation = resolve(to) as RouteLocationNormalized
 
@@ -781,7 +1172,39 @@ export function createRouter(options: RouterOptions): Router {
         return
       }
 
-      pendingLocation = toLocation
+      // Handle layers from history state if available
+      if (info.layers && info.layers.length > 0) {
+        // Resolve all layer locations
+        const resolvedLayers = info.layers.map((layerPath, index) => {
+          const current =
+            index < currentRoutes.value.length
+              ? currentRoutes.value[index]
+              : currentRoute.value
+          return resolve(layerPath, current) as RouteLocationNormalized
+        })
+        // If there's only one layer and it matches toLocation, use toLocation directly
+        // to avoid object reference mismatch in checkCanceledNavigation
+        if (
+          resolvedLayers.length === 1 &&
+          resolvedLayers[0].fullPath === toLocation.fullPath
+        ) {
+          pendingLocations = [toLocation]
+        } else {
+          pendingLocations = resolvedLayers
+        }
+        if (__DEV__)
+          console.log('[Router] Setting pendingLocations from layers', {
+            layers: info.layers,
+            pendingLocations: pendingLocations.map(l => l.fullPath),
+          })
+      } else {
+        // Fallback to single location
+        pendingLocations = [toLocation]
+        if (__DEV__)
+          console.log('[Router] Setting pendingLocations to single location', {
+            toLocation: toLocation.fullPath,
+          })
+      }
       const from = currentRoute.value
 
       // TODO: should be moved to web history?
@@ -792,8 +1215,18 @@ export function createRouter(options: RouterOptions): Router {
         )
       }
 
+      if (__DEV__)
+        console.log('[Router] History listener triggering navigation', {
+          to: toLocation.fullPath,
+          from: from.fullPath,
+          info,
+        })
       navigate(toLocation, from)
+        .then(failure => {
+          if (__DEV__) console.log('[Router] Navigation completed', { failure })
+        })
         .catch((error: NavigationFailure | NavigationRedirectError) => {
+          if (__DEV__) console.error('[Router] Navigation error', error)
           if (
             isNavigationFailure(
               error,
@@ -849,29 +1282,33 @@ export function createRouter(options: RouterOptions): Router {
           // unrecognized error, transfer to the global handler
           return triggerError(error, toLocation, from)
         })
-        .then((failure: NavigationFailure | void) => {
-          failure =
-            failure ||
+        .then((failure: unknown) => {
+          const navFailure = failure as NavigationFailure | void
+          const finalFailure =
+            navFailure ||
             finalizeNavigation(
               // after navigation, all matched components are resolved
-              toLocation as RouteLocationNormalizedLoaded,
-              from,
+              [toLocation as RouteLocationNormalizedLoaded],
+              [from],
               false
             )
 
           // revert the navigation
-          if (failure) {
+          if (finalFailure) {
             if (
               info.delta &&
               // a new navigation has been triggered, so we do not want to revert, that will change the current history
               // entry while a different route is displayed
-              !isNavigationFailure(failure, ErrorTypes.NAVIGATION_CANCELLED)
+              !isNavigationFailure(
+                finalFailure,
+                ErrorTypes.NAVIGATION_CANCELLED
+              )
             ) {
               routerHistory.go(-info.delta, false)
             } else if (
               info.type === NavigationType.pop &&
               isNavigationFailure(
-                failure,
+                finalFailure,
                 ErrorTypes.NAVIGATION_ABORTED | ErrorTypes.NAVIGATION_DUPLICATED
               )
             ) {
@@ -884,7 +1321,7 @@ export function createRouter(options: RouterOptions): Router {
           triggerAfterEach(
             toLocation as RouteLocationNormalizedLoaded,
             from,
-            failure
+            finalFailure
           )
         })
         // avoid warnings in the console about uncaught rejections, they are logged by triggerErrors
@@ -977,13 +1414,26 @@ export function createRouter(options: RouterOptions): Router {
       .catch(err => triggerError(err, to, from))
   }
 
-  const go = (delta: number) => routerHistory.go(delta)
+  const go = (delta: number) => {
+    // Call routerHistory.go() which triggers window.history.go()
+    // This fires a popstate event that will be handled by the history listener
+    // The listener will then call navigate() which triggers beforeEach guards
+    //
+    // Note: In router-legacy, go() also just called window.history.go() and relied
+    // on popstate events. The popstate handler should trigger navigation automatically.
+    // If it doesn't, there may be an issue with the history listener setup.
+    routerHistory.go(delta)
+  }
 
   let started: boolean | undefined
   const installedApps = new Set<App>()
 
   const router: Router = {
     currentRoute,
+    // Expose currentRoutes for internal use (e.g., RouterView)
+    get currentRoutes() {
+      return currentRoutes.value
+    },
     listening: true,
 
     addRoute,
@@ -999,6 +1449,15 @@ export function createRouter(options: RouterOptions): Router {
     go,
     back: () => go(-1),
     forward: () => go(1),
+
+    pushAddLayer,
+    replaceAddLayer,
+    pushRemoveLayer,
+    replaceRemoveLayer,
+    pushLayer,
+    replaceLayer,
+    pushAllLayers,
+    replaceAllLayers,
 
     beforeEach: beforeGuards.add,
     beforeResolve: beforeResolveGuards.add,
@@ -1045,6 +1504,10 @@ export function createRouter(options: RouterOptions): Router {
       app.provide(routerKey, router)
       app.provide(routeLocationKey, shallowReactive(reactiveRoute))
       app.provide(routerViewLocationKey, currentRoute)
+      // Provide layer context (default to layer 0)
+      app.provide(routerLayerKey, 0)
+      // Provide routes array for multi-layer support (reactive)
+      app.provide(routerRoutesKey, currentRoutes)
 
       const unmountApp = app.unmount
       installedApps.add(app)
@@ -1053,10 +1516,10 @@ export function createRouter(options: RouterOptions): Router {
         // the router is not attached to an app anymore
         if (installedApps.size < 1) {
           // invalidate the current navigation
-          pendingLocation = START_LOCATION_NORMALIZED
+          pendingLocations = [START_LOCATION_NORMALIZED]
           removeHistoryListener && removeHistoryListener()
           removeHistoryListener = null
-          currentRoute.value = START_LOCATION_NORMALIZED
+          currentRoutes.value = [START_LOCATION_NORMALIZED]
           started = false
           ready = false
         }

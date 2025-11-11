@@ -229,6 +229,124 @@ function canOnlyBeCalledOnce(
   }
 }
 
+/**
+ * Wraps a navigation guard to accept arrays of routes (layers) instead of single routes.
+ * This matches router-legacy behavior where beforeEach receives (routes, current, next).
+ *
+ * @param guard - The navigation guard function (can accept arrays or single routes)
+ * @param toRoutes - Array of routes being navigated to (layers)
+ * @param fromRoutes - Array of current routes (layers)
+ * @param runWithContext - Function to run guard with Vue context
+ */
+export function guardToPromiseFnWithLayers(
+  guard:
+    | NavigationGuard
+    | ((
+        to: RouteLocationNormalized[],
+        from: RouteLocationNormalizedLoaded[],
+        next: NavigationGuardNext
+      ) => any),
+  toRoutes: RouteLocationNormalized[],
+  fromRoutes: RouteLocationNormalizedLoaded[],
+  runWithContext: <T>(fn: () => T) => T = fn => fn()
+): () => Promise<void> {
+  return () =>
+    new Promise((resolve, reject) => {
+      const next: NavigationGuardNext = (
+        valid?: boolean | RouteLocationRaw | NavigationGuardNextCallback | Error
+      ) => {
+        if (valid === false) {
+          reject(
+            createRouterError<NavigationFailure>(
+              ErrorTypes.NAVIGATION_ABORTED,
+              {
+                from: fromRoutes[fromRoutes.length - 1] || fromRoutes[0],
+                to: toRoutes[toRoutes.length - 1] || toRoutes[0],
+              }
+            )
+          )
+        } else if (valid instanceof Error) {
+          reject(valid)
+        } else if (isRouteLocation(valid)) {
+          reject(
+            createRouterError<NavigationRedirectError>(
+              ErrorTypes.NAVIGATION_GUARD_REDIRECT,
+              {
+                from: toRoutes[toRoutes.length - 1] || toRoutes[0],
+                to: valid,
+              }
+            )
+          )
+        } else {
+          if (typeof valid === 'function') {
+            // Store callback for beforeRouteEnter (not applicable for beforeEach but keeping for compatibility)
+            // This would need to be handled differently if we support beforeRouteEnter with layers
+          }
+          resolve()
+        }
+      }
+
+      // wrapping with Promise.resolve allows it to work with both async and sync guards
+      const guardReturn = runWithContext(() =>
+        guard.call(
+          undefined,
+          toRoutes,
+          fromRoutes,
+          __DEV__
+            ? canOnlyBeCalledOnceForLayers(next, toRoutes, fromRoutes)
+            : next
+        )
+      )
+      let guardCall = Promise.resolve(guardReturn)
+
+      if (guard.length < 3) guardCall = guardCall.then(next)
+      if (__DEV__ && guard.length > 2) {
+        const to = toRoutes[toRoutes.length - 1] || toRoutes[0]
+        const from = fromRoutes[fromRoutes.length - 1] || fromRoutes[0]
+        const message = `The "next" callback was never called inside of ${
+          guard.name ? '"' + guard.name + '"' : ''
+        }:\n${guard.toString()}\n. If you are returning a value instead of calling "next", make sure to remove the "next" parameter from your function.`
+        if (typeof guardReturn === 'object' && 'then' in guardReturn) {
+          guardCall = guardCall.then(resolvedValue => {
+            // @ts-expect-error: _called is added at canOnlyBeCalledOnceForLayers
+            if (!next._called) {
+              warn(message)
+              return Promise.reject(new Error('Invalid navigation guard'))
+            }
+            return resolvedValue
+          })
+        } else if (guardReturn !== undefined) {
+          // @ts-expect-error: _called is added at canOnlyBeCalledOnceForLayers
+          if (!next._called) {
+            warn(message)
+            reject(new Error('Invalid navigation guard'))
+            return
+          }
+        }
+      }
+      guardCall.catch(err => reject(err))
+    })
+}
+
+function canOnlyBeCalledOnceForLayers(
+  next: NavigationGuardNext,
+  toRoutes: RouteLocationNormalized[],
+  fromRoutes: RouteLocationNormalized[]
+): NavigationGuardNext {
+  let called = 0
+  const to = toRoutes[toRoutes.length - 1] || toRoutes[0]
+  const from = fromRoutes[fromRoutes.length - 1] || fromRoutes[0]
+  return function () {
+    if (called++ === 1)
+      warn(
+        `The "next" callback was called more than once in one navigation guard when going from "${from.fullPath}" to "${to.fullPath}". It should be called exactly one time in each navigation guard. This will fail in production.`
+      )
+    // @ts-expect-error: we put it in the original one because it's easier to check
+    next._called = true
+    if (called === 1) next.apply(null, arguments as any)
+  }
+}
+
 type GuardType = 'beforeRouteEnter' | 'beforeRouteUpdate' | 'beforeRouteLeave'
 
 export function extractComponentsGuards(
@@ -245,8 +363,11 @@ export function extractComponentsGuards(
       __DEV__ &&
       !record.components &&
       // in the new records, there is no children, only parents
-      record.children &&
-      !record.children.length
+      // Check if record has children (normalized routes don't have children property, they're flattened)
+      // Only warn if there's truly no component and no way to render
+      (!record.children || record.children.length === 0) &&
+      // Don't warn for empty path routes that have children (they're valid parent routes)
+      record.path !== ''
     ) {
       warn(
         `Record with path "${record.path}" is either missing a "component(s)"` +

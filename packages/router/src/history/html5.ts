@@ -28,6 +28,8 @@ interface StateEntry extends HistoryState {
   position: number
   replaced: boolean
   scroll: _ScrollPositionNormalized | null | false
+  // Store all layer paths for multi-layer support (matching router-legacy structure)
+  state?: HistoryLocation[]
 }
 
 /**
@@ -96,16 +98,28 @@ function useHistoryListeners(
     // to be updated before triggering the listeners. Some kind of validation function would also
     // need to be passed to the listeners so the navigation can be accepted
     // call all listeners
-    listeners.forEach(listener => {
-      listener(currentLocation.value, from, {
-        delta,
-        type: NavigationType.pop,
-        direction: delta
-          ? delta > 0
-            ? NavigationDirection.forward
-            : NavigationDirection.back
-          : NavigationDirection.unknown,
+    // Pass layers information if available
+    const navigationInfo = {
+      delta,
+      type: NavigationType.pop,
+      direction: delta
+        ? delta > 0
+          ? NavigationDirection.forward
+          : NavigationDirection.back
+        : NavigationDirection.unknown,
+      // Include layers for multi-layer support (matching router-legacy: state.state)
+      layers: state?.state,
+    }
+
+    if (__DEV__)
+      console.log('[Router] Popstate handler calling listeners', {
+        listenersCount: listeners.length,
+        to: currentLocation.value,
+        from,
+        navigationInfo,
       })
+    listeners.forEach(listener => {
+      listener(currentLocation.value, from, navigationInfo)
     })
   }
 
@@ -168,7 +182,8 @@ function buildState(
   current: HistoryLocation,
   forward: HistoryLocation | null,
   replaced: boolean = false,
-  computeScroll: boolean = false
+  computeScroll: boolean = false,
+  layers?: HistoryLocation[]
 ): StateEntry {
   return {
     back,
@@ -177,6 +192,8 @@ function buildState(
     replaced,
     position: window.history.length,
     scroll: computeScroll ? computeScrollPosition() : null,
+    // Match router-legacy structure: store layers in state.state
+    state: layers,
   }
 }
 
@@ -245,6 +262,8 @@ function useHistoryStateNavigation(base: string) {
   }
 
   function replace(to: HistoryLocation, data?: HistoryState) {
+    // Extract layers from data if provided (matching router-legacy: state.state)
+    const layers = (data as StateEntry)?.state
     const state: StateEntry = assign(
       {},
       history.state,
@@ -253,7 +272,9 @@ function useHistoryStateNavigation(base: string) {
         // keep back and forward entries but override current position
         to,
         historyState.value.forward,
-        true
+        true,
+        false,
+        layers || historyState.value.state
       ),
       data,
       { position: historyState.value.position }
@@ -289,9 +310,11 @@ function useHistoryStateNavigation(base: string) {
 
     changeLocation(currentState.current, currentState, true)
 
+    // Extract layers from data if provided (matching router-legacy: state.state)
+    const layers = (data as StateEntry)?.state
     const state: StateEntry = assign(
       {},
-      buildState(currentLocation.value, to, null),
+      buildState(currentLocation.value, to, null, false, false, layers),
       { position: currentState.position + 1 },
       data
     )

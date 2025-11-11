@@ -13,6 +13,7 @@ import {
   type ComponentCustomProps,
   getCurrentInstance,
   watchEffect,
+  type Ref,
   // this is a workaround for https://github.com/microsoft/rushstack/issues/1050
   // this file is meant to be prepended to the generated dist/src/RouterLink.d.ts
   // @ts-ignore
@@ -29,7 +30,7 @@ import {
   type AnchorHTMLAttributes,
 } from 'vue'
 import { isSameRouteLocationParams, isSameRouteRecord } from './location'
-import { routerKey, routeLocationKey } from './injectionSymbols'
+import { routerKey, routeLocationKey, routerLayerKey } from './injectionSymbols'
 import { RouteRecord } from './matcher/types'
 import { NavigationFailure } from './errors'
 import { isArray, isBrowser, noop } from './utils'
@@ -89,6 +90,16 @@ export interface RouterLinkProps extends RouterLinkOptions {
    * Pass the returned promise of `router.push()` to `document.startViewTransition()` if supported.
    */
   viewTransition?: boolean
+
+  /**
+   * If true, add a new layer when navigating
+   */
+  addLayer?: boolean
+
+  /**
+   * If true, remove the last layer when navigating
+   */
+  removeLayer?: boolean
 }
 
 /**
@@ -119,6 +130,16 @@ export interface UseLinkOptions<Name extends keyof RouteMap = keyof RouteMap> {
    * Pass the returned promise of `router.push()` to `document.startViewTransition()` if supported.
    */
   viewTransition?: boolean
+
+  /**
+   * If true, add a new layer when navigating
+   */
+  addLayer?: MaybeRef<boolean | undefined>
+
+  /**
+   * If true, remove the last layer when navigating
+   */
+  removeLayer?: MaybeRef<boolean | undefined>
 }
 
 /**
@@ -226,10 +247,33 @@ export function useLink<Name extends keyof RouteMap = keyof RouteMap>(
     e: MouseEvent = {} as MouseEvent
   ): Promise<void | NavigationFailure> {
     if (guardEvent(e)) {
-      const p = router[unref(props.replace) ? 'replace' : 'push'](
-        unref(props.to)
-        // avoid uncaught errors are they are logged anyway
-      ).catch(noop)
+      const replace = unref(props.replace)
+      const addLayer = unref(props.addLayer)
+      const removeLayer = unref(props.removeLayer)
+      const to = unref(props.to)
+
+      // Get current layer from injection (matching router-legacy behavior)
+      const currentLayer = inject(routerLayerKey, 0)
+      const layerIndex =
+        typeof currentLayer === 'number' ? currentLayer : unref(currentLayer)
+
+      let p: Promise<void | NavigationFailure>
+
+      if (addLayer) {
+        p = router[replace ? 'replaceAddLayer' : 'pushAddLayer'](to).catch(noop)
+      } else if (removeLayer) {
+        p =
+          router[replace ? 'replaceRemoveLayer' : 'pushRemoveLayer']().catch(
+            noop
+          )
+      } else {
+        // Match router-legacy: use pushLayer/replaceLayer with current layer
+        p = router[replace ? 'replaceLayer' : 'pushLayer'](
+          layerIndex,
+          to
+        ).catch(noop)
+      }
+
       if (
         props.viewTransition &&
         typeof document !== 'undefined' &&
@@ -305,6 +349,8 @@ export const RouterLinkImpl = /*#__PURE__*/ defineComponent({
       default: 'page',
     },
     viewTransition: Boolean,
+    addLayer: Boolean,
+    removeLayer: Boolean,
   },
 
   useLink,
