@@ -111,13 +111,6 @@ function useHistoryListeners(
       layers: state?.state,
     }
 
-    if (__DEV__)
-      console.log('[Router] Popstate handler calling listeners', {
-        listenersCount: listeners.length,
-        to: currentLocation.value,
-        from,
-        navigationInfo,
-      })
     listeners.forEach(listener => {
       listener(currentLocation.value, from, navigationInfo)
     })

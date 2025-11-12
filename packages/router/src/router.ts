@@ -434,12 +434,6 @@ export function createRouter(options: RouterOptions): Router {
   ): NavigationFailure | void {
     // Check if navigation was canceled by comparing with pending locations
     const lastPending = pendingLocations[pendingLocations.length - 1]
-    if (__DEV__)
-      console.log('[Router] checkCanceledNavigation', {
-        lastPending: lastPending?.fullPath,
-        to: to.fullPath,
-        pendingLocations: pendingLocations.map(l => l.fullPath),
-      })
     if (lastPending !== to) {
       if (__DEV__)
         console.warn(
@@ -636,15 +630,32 @@ export function createRouter(options: RouterOptions): Router {
     redirectedFrom?: RouteLocation
   ): Promise<NavigationFailure | void | undefined> {
     const targetLocation: RouteLocation = resolve(to)
-    // Preserve pendingLocations if it already has multiple entries (set by navigateAllLayers)
-    // This is important for redirects - we want to maintain the multi-layer structure
+    // Preserve pendingLocations if it already has multiple entries AND:
+    // 1. We're in a redirect (preserve multi-layer structure through redirects)
+    // 2. The last entry's fullPath matches targetLocation (navigateAllLayers just set it)
+    // Otherwise, reset to single location for regular navigations
     const hadMultipleLayers = pendingLocations.length > 1
-    if (hadMultipleLayers) {
-      // Update the last entry to the new target (in case of redirects)
-      // This preserves the multi-layer structure through redirects
-      pendingLocations[pendingLocations.length - 1] = targetLocation
+    const isRedirect = redirectedFrom !== undefined
+    const lastPending = hadMultipleLayers
+      ? pendingLocations[pendingLocations.length - 1]
+      : null
+    const lastPendingMatchesTarget =
+      lastPending && lastPending.fullPath === targetLocation.fullPath
+
+    if (hadMultipleLayers && (isRedirect || lastPendingMatchesTarget)) {
+      if (isRedirect) {
+        // Update the last entry to the new target (in case of redirects)
+        // This preserves the multi-layer structure through redirects
+        pendingLocations[pendingLocations.length - 1] = targetLocation
+      } else if (lastPendingMatchesTarget) {
+        // navigateAllLayers just set pendingLocations correctly
+        // Update the last entry to use the resolved targetLocation to ensure object reference matches
+        // This prevents "pending location mismatch" errors in checkCanceledNavigation
+        pendingLocations[pendingLocations.length - 1] = targetLocation
+      }
     } else {
-      // Only reset to single location if we didn't have multiple layers
+      // Reset to single location for regular navigations
+      // This ensures single-route navigations don't accidentally use multiple layers
       pendingLocations = [targetLocation]
     }
     const from = currentRoute.value
@@ -850,17 +861,9 @@ export function createRouter(options: RouterOptions): Router {
     guards.push(canceledNavigationCheck)
 
     // run the queue of per route beforeRouteLeave guards
-    if (__DEV__)
-      console.log('[Router] Running beforeRouteLeave guards', {
-        guardsCount: guards.length,
-      })
     return (
       runGuardQueue(guards)
         .then(() => {
-          if (__DEV__)
-            console.log(
-              '[Router] beforeRouteLeave guards completed, moving to beforeEach'
-            )
           // check global guards beforeEach
           // Pass arrays of routes (layers) to match router-legacy behavior
           guards = []
@@ -896,12 +899,6 @@ export function createRouter(options: RouterOptions): Router {
           const fromRoutes = currentRoutes.value.slice(-2)
 
           const beforeGuardsList = beforeGuards.list()
-          if (__DEV__)
-            console.log('[Router] beforeEach guards to execute', {
-              count: beforeGuardsList.length,
-              toRoutes: toRoutes.map(r => r.fullPath),
-              fromRoutes: fromRoutes.map(r => r.fullPath),
-            })
           for (const guard of beforeGuardsList) {
             guards.push(
               guardToPromiseFnWithLayers(
@@ -914,10 +911,6 @@ export function createRouter(options: RouterOptions): Router {
           }
           guards.push(canceledNavigationCheck)
 
-          if (__DEV__)
-            console.log('[Router] Running beforeEach guard queue', {
-              guardsCount: guards.length,
-            })
           return runGuardQueue(guards)
         })
         .then(() => {
@@ -1109,6 +1102,7 @@ export function createRouter(options: RouterOptions): Router {
     // to prevent non-modal routes from being rendered in next-layer
     if (toLocations.length === 1) {
       // Single route navigation - always use single layer
+      // Don't use pendingLocations even if it has multiple entries
       currentRoutes.value = toLocations
     } else if (
       pendingLocations.length > 1 &&
@@ -1117,9 +1111,10 @@ export function createRouter(options: RouterOptions): Router {
       // Multiple layers navigation - use toLocations which has resolved components
       // Limit to max 2 layers (take last 2)
       currentRoutes.value = toLocations.slice(-2)
-    } else if (pendingLocations.length > 1) {
+    } else if (pendingLocations.length > 1 && toLocations.length > 1) {
       // Fallback: Convert pendingLocations to loaded locations
       // This should rarely happen, but ensures we have the right number of layers
+      // Only do this if toLocations also has multiple entries
       // Limit to max 2 layers (take last 2)
       const loadedLocations = pendingLocations.slice(-2).map((loc, index) => {
         // Prefer toLocations[index] if available (has resolved components)
@@ -1192,18 +1187,9 @@ export function createRouter(options: RouterOptions): Router {
         } else {
           pendingLocations = resolvedLayers
         }
-        if (__DEV__)
-          console.log('[Router] Setting pendingLocations from layers', {
-            layers: info.layers,
-            pendingLocations: pendingLocations.map(l => l.fullPath),
-          })
       } else {
         // Fallback to single location
         pendingLocations = [toLocation]
-        if (__DEV__)
-          console.log('[Router] Setting pendingLocations to single location', {
-            toLocation: toLocation.fullPath,
-          })
       }
       const from = currentRoute.value
 
@@ -1215,18 +1201,11 @@ export function createRouter(options: RouterOptions): Router {
         )
       }
 
-      if (__DEV__)
-        console.log('[Router] History listener triggering navigation', {
-          to: toLocation.fullPath,
-          from: from.fullPath,
-          info,
-        })
       navigate(toLocation, from)
         .then(failure => {
-          if (__DEV__) console.log('[Router] Navigation completed', { failure })
+          // Navigation completed
         })
         .catch((error: NavigationFailure | NavigationRedirectError) => {
-          if (__DEV__) console.error('[Router] Navigation error', error)
           if (
             isNavigationFailure(
               error,
