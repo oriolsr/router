@@ -502,12 +502,123 @@ export function createRouter(options: RouterOptions): Router {
   }
 
   function replaceLayer(layer: number, to: RouteLocationRaw) {
+    // Use direct replacement without triggering navigation guards
+    // This matches router-legacy behavior where routerLayer.replace doesn't trigger guards
+    replaceLayerDirect(layer, to)
+    return Promise.resolve()
+  }
+
+  // Direct layer replacement without triggering navigation guards
+  // This is used by routerLayer.replace() to update the URL and route without guards
+  function replaceLayerDirect(layer: number, to: RouteLocationRaw): void {
+    const resolvedTo = resolve(to)
     const newLocations = [
       ...currentRoutes.value.slice(0, layer).map(r => r.fullPath),
-      resolve(to).fullPath,
+      resolvedTo.fullPath,
       ...currentRoutes.value.slice(layer + 1).map(r => r.fullPath),
     ]
-    return navigateAllLayers(newLocations, false)
+
+    // Resolve all locations
+    const resolvedLocations = newLocations.map((loc, index) => {
+      const current =
+        index < currentRoutes.value.length
+          ? currentRoutes.value[index]
+          : currentRoute.value
+      return resolve(loc, current) as RouteLocationNormalized
+    })
+
+    // Limit to max 2 layers
+    const limitedLocations = resolvedLocations.slice(-2)
+
+    // Ensure we don't have duplicate routes
+    if (limitedLocations.length === 2) {
+      const [first, second] = limitedLocations
+      if (first.fullPath === second.fullPath) {
+        limitedLocations.splice(0, 1)
+      }
+    }
+
+    // Check if routes need component loading
+    // For same-route updates (e.g., query param changes), components are already loaded
+    const needsLoading = limitedLocations.some(loc => {
+      const hasUnresolved = loc.matched.some(
+        record =>
+          record.components &&
+          Object.values(record.components).some(
+            comp => typeof comp === 'function'
+          )
+      )
+      return hasUnresolved
+    })
+
+    if (needsLoading) {
+      // Load components asynchronously
+      Promise.all(limitedLocations.map(loc => loadRouteLocation(loc)))
+        .then(loadedLocations => {
+          updateRoutesDirectly(loadedLocations)
+        })
+        .catch(() => {
+          // Fallback: use resolved locations even if loading fails
+          updateRoutesDirectly(
+            limitedLocations.map(loc => loc as RouteLocationNormalizedLoaded)
+          )
+        })
+    } else {
+      // Components already loaded, update synchronously
+      const loadedLocations = limitedLocations.map(loc => {
+        // Reuse existing loaded route if it's the same route, otherwise use resolved
+        const existing = currentRoutes.value.find(r =>
+          isSameRouteLocation(stringifyQuery, r, loc)
+        )
+        return existing || (loc as RouteLocationNormalizedLoaded)
+      })
+      updateRoutesDirectly(loadedLocations)
+    }
+
+    function updateRoutesDirectly(
+      loadedLocations: RouteLocationNormalizedLoaded[]
+    ) {
+      // Set pendingLocations to prevent navigation guard checks
+      pendingLocations = loadedLocations.map(
+        loc => loc as RouteLocationNormalized
+      )
+
+      // Get the last location for URL update
+      const lastLocation = loadedLocations[loadedLocations.length - 1]
+      const fromLocations = currentRoutes.value
+
+      // Prepare layers array for history state
+      const layers = loadedLocations.map(loc => loc.fullPath)
+      const isFirstNavigation =
+        fromLocations.length === 0 ||
+        fromLocations[0] === START_LOCATION_NORMALIZED
+      const state: Partial<HistoryState> | null = !isBrowser
+        ? {}
+        : history.state
+
+      // Update URL directly without triggering navigation
+      routerHistory.replace(
+        lastLocation.fullPath,
+        assign(
+          {
+            scroll: isFirstNavigation && state && state.scroll,
+            state: layers,
+          },
+          {}
+        )
+      )
+
+      // Update currentRoutes directly
+      currentRoutes.value = loadedLocations
+
+      // Handle scroll if needed
+      handleScroll(
+        lastLocation,
+        fromLocations[fromLocations.length - 1] || START_LOCATION_NORMALIZED,
+        true,
+        isFirstNavigation
+      )
+    }
   }
 
   function pushAllLayers(locations: RouteLocationRaw[]) {
