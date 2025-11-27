@@ -218,9 +218,10 @@ export function createRouter(options: RouterOptions): Router {
     START_LOCATION_NORMALIZED,
   ])
   // Keep currentRoute for backward compatibility (returns last layer)
-  const currentRoute = computed(
-    () => currentRoutes.value[currentRoutes.value.length - 1]
-  )
+  const currentRoute = computed(() => {
+    const route = currentRoutes.value[currentRoutes.value.length - 1]
+    return route
+  })
   let pendingLocations: RouteLocation[] = [START_LOCATION_NORMALIZED]
 
   // leave the scrollRestoration if no scrollBehavior is provided
@@ -559,20 +560,13 @@ export function createRouter(options: RouterOptions): Router {
     // Create a location object with replace flag if needed
     const locationOptions: RouteLocationOptions = push ? {} : { replace: true }
 
+    // pushWithRedirect will trigger the navigation flow which calls finalizeNavigation
+    // finalizeNavigation is responsible for updating currentRoutes.value
+    // We don't need to update it here - doing so would cause duplicate updates and
+    // the comparison would be against the already-updated route, making it always "same"
     return pushWithRedirect(
       assign(locationAsObject(lastLocation), locationOptions)
-    ).then(failure => {
-      if (failure) {
-        return failure
-      }
-      // Update all layers after successful navigation
-      // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
-      const loadedLocations = resolvedLocations
-        .slice(-2)
-        .map(loc => resolve(loc.fullPath) as RouteLocationNormalizedLoaded)
-      currentRoutes.value = loadedLocations
-      return undefined
-    })
+    )
   }
 
   function handleRedirectRecord(
@@ -1100,36 +1094,60 @@ export function createRouter(options: RouterOptions): Router {
     // IMPORTANT: Limit to max 2 layers (router supports max 2 layers)
     // IMPORTANT: If toLocations has only one entry, we should only have one layer in currentRoutes
     // to prevent non-modal routes from being rendered in next-layer
-    if (toLocations.length === 1) {
-      // Single route navigation - always use single layer
-      // Don't use pendingLocations even if it has multiple entries
-      currentRoutes.value = toLocations
-    } else if (
-      pendingLocations.length > 1 &&
-      toLocations.length === pendingLocations.length
+
+    // Check if the route is the same as the current route to avoid unnecessary updates
+    // This prevents currentRoute (computed from currentRoutes) from changing reference
+    // when the route is logically the same, which would trigger watchers unnecessarily
+    const currentLastRoute = currentRoutes.value[currentRoutes.value.length - 1]
+    const isSameRoute =
+      currentLastRoute &&
+      isSameRouteLocation(stringifyQuery, currentLastRoute, toLocation)
+
+    // If the route is the same and we're doing a single-layer navigation, don't update
+    // This prevents currentRoute computed from returning a new reference unnecessarily
+    if (
+      isSameRoute &&
+      toLocations.length === 1 &&
+      currentRoutes.value.length === 1
     ) {
-      // Multiple layers navigation - use toLocations which has resolved components
-      // Limit to max 2 layers (take last 2)
-      currentRoutes.value = toLocations.slice(-2)
-    } else if (pendingLocations.length > 1 && toLocations.length > 1) {
-      // Fallback: Convert pendingLocations to loaded locations
-      // This should rarely happen, but ensures we have the right number of layers
-      // Only do this if toLocations also has multiple entries
-      // Limit to max 2 layers (take last 2)
-      const loadedLocations = pendingLocations.slice(-2).map((loc, index) => {
-        // Prefer toLocations[index] if available (has resolved components)
-        // Adjust index to account for slice(-2)
-        const toLocationsIndex = toLocations.length - 2 + index
-        if (toLocationsIndex >= 0 && toLocationsIndex < toLocations.length) {
-          return toLocations[toLocationsIndex]
-        }
-        // Otherwise resolve the location (components should be resolved by now)
-        return resolve(loc.fullPath) as RouteLocationNormalizedLoaded
-      })
-      currentRoutes.value = loadedLocations
+      // Route is the same, no need to update currentRoutes.value
+      // This keeps currentRoute returning the same object reference
     } else {
-      // Single layer - limit to 1
-      currentRoutes.value = toLocations.slice(-1)
+      // Route changed or multi-layer navigation - update currentRoutes
+      let newCurrentRoutes: RouteLocationNormalizedLoaded[]
+      if (toLocations.length === 1) {
+        // Single route navigation - always use single layer
+        // Don't use pendingLocations even if it has multiple entries
+        newCurrentRoutes = toLocations
+      } else if (
+        pendingLocations.length > 1 &&
+        toLocations.length === pendingLocations.length
+      ) {
+        // Multiple layers navigation - use toLocations which has resolved components
+        // Limit to max 2 layers (take last 2)
+        newCurrentRoutes = toLocations.slice(-2)
+      } else if (pendingLocations.length > 1 && toLocations.length > 1) {
+        // Fallback: Convert pendingLocations to loaded locations
+        // This should rarely happen, but ensures we have the right number of layers
+        // Only do this if toLocations also has multiple entries
+        // Limit to max 2 layers (take last 2)
+        const loadedLocations = pendingLocations.slice(-2).map((loc, index) => {
+          // Prefer toLocations[index] if available (has resolved components)
+          // Adjust index to account for slice(-2)
+          const toLocationsIndex = toLocations.length - 2 + index
+          if (toLocationsIndex >= 0 && toLocationsIndex < toLocations.length) {
+            return toLocations[toLocationsIndex]
+          }
+          // Otherwise resolve the location (components should be resolved by now)
+          return resolve(loc.fullPath) as RouteLocationNormalizedLoaded
+        })
+        newCurrentRoutes = loadedLocations
+      } else {
+        // Single layer - limit to 1
+        newCurrentRoutes = toLocations.slice(-1)
+      }
+
+      currentRoutes.value = newCurrentRoutes
     }
     handleScroll(toLocation, from, isPush, isFirstNavigation)
 
