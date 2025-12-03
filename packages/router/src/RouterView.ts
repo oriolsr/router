@@ -41,6 +41,67 @@ export interface RouterViewProps {
   nextLayer?: boolean
 }
 
+/**
+ * Helper function to call lifecycle hooks on a component instance
+ */
+function callLifecycleHook(
+  instance: ComponentPublicInstance,
+  hookName: 'activated' | 'deactivated'
+) {
+  try {
+    // Options API hook
+    const optionsHook = (instance as any)?.$options?.[hookName]
+    if (typeof optionsHook === 'function') {
+      optionsHook.call(instance)
+    } else if (Array.isArray(optionsHook)) {
+      optionsHook.forEach(hook => {
+        if (typeof hook === 'function') {
+          hook.call(instance)
+        }
+      })
+    }
+
+    // Composition API hooks are stored in the instance
+    const compositionHooks = (instance as any)?.[hookName]
+    if (Array.isArray(compositionHooks)) {
+      compositionHooks.forEach(hook => {
+        if (typeof hook === 'function') {
+          hook()
+        }
+      })
+    }
+  } catch (error) {
+    if (__DEV__) {
+      warn(`Error calling ${hookName} hook: ${error}`)
+    }
+  }
+}
+
+/**
+ * Trigger lifecycle hooks on all matched route instances for a specific layer
+ */
+function callHooksOnLayer(
+  routes: RouteLocationNormalizedLoaded[],
+  layer: number,
+  hookName: 'activated' | 'deactivated'
+) {
+  if (layer >= routes.length || !routes[layer]) {
+    return
+  }
+
+  const route = routes[layer]
+
+  // Iterate through all matched route records for this layer
+  route.matched.forEach(record => {
+    // Call hooks on all component instances in this record
+    Object.values(record.instances).forEach(instance => {
+      if (instance) {
+        callLifecycleHook(instance, hookName)
+      }
+    })
+  })
+}
+
 export interface RouterViewDevtoolsContext
   extends Pick<RouteLocationMatched, 'path' | 'name' | 'meta'> {
   depth: number
@@ -151,6 +212,28 @@ export const RouterViewImpl = /*#__PURE__*/ defineComponent({
     provide(routerLayerKey, layerIndex)
 
     const viewRef = ref<ComponentPublicInstance>()
+
+    // Watch for layer changes (only on layer 0 to avoid duplicate watchers)
+    // The system supports max 2 layers: layer 0 (main) and layer 1 (overlay)
+    // Using flush: 'pre' to trigger hooks BEFORE the component re-renders
+    if (injectedLayer === 0 && injectedRoutes) {
+      watch(
+        () => injectedRoutes.value.length,
+        (newLayerCount, oldLayerCount) => {
+          // Layer 1 was added (went from 1 to 2 layers)
+          if (oldLayerCount === 1 && newLayerCount === 2) {
+            // Deactivate layer 0 BEFORE layer 1 renders
+            callHooksOnLayer(injectedRoutes.value, 0, 'deactivated')
+          }
+          // Layer 1 was removed (went from 2 to 1 layers)
+          else if (oldLayerCount === 2 && newLayerCount === 1) {
+            // Reactivate layer 0 BEFORE re-render
+            callHooksOnLayer(injectedRoutes.value, 0, 'activated')
+          }
+        },
+        { flush: 'pre' }
+      )
+    }
 
     // watch at the same time the component instance, the route record we are
     // rendering, and the name
