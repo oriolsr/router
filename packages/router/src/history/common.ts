@@ -48,6 +48,8 @@ export interface NavigationInformation {
   type: NavigationType
   direction: NavigationDirection
   delta: number
+  // Layers array for multi-layer support
+  layers?: HistoryLocation[]
 }
 
 export interface NavigationCallback {

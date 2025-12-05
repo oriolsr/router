@@ -26,15 +26,80 @@ import {
   matchedRouteKey,
   viewDepthKey,
   routerViewLocationKey,
+  routerLayerKey,
+  routerRoutesKey,
 } from './injectionSymbols'
 import { assign, isArray, isBrowser } from './utils'
 import { warn } from './warning'
-import { isSameRouteRecord } from './location'
+import { isSameRouteRecord, START_LOCATION_NORMALIZED } from './location'
 
 export interface RouterViewProps {
   name?: string
   // allow looser type for user facing api
   route?: RouteLocationNormalized
+  // If true, render the next layer instead of the current layer
+  nextLayer?: boolean
+}
+
+/**
+ * Helper function to call lifecycle hooks on a component instance
+ */
+function callLifecycleHook(
+  instance: ComponentPublicInstance,
+  hookName: 'activated' | 'deactivated'
+) {
+  try {
+    // Options API hook
+    const optionsHook = (instance as any)?.$options?.[hookName]
+    if (typeof optionsHook === 'function') {
+      optionsHook.call(instance)
+    } else if (Array.isArray(optionsHook)) {
+      optionsHook.forEach(hook => {
+        if (typeof hook === 'function') {
+          hook.call(instance)
+        }
+      })
+    }
+
+    // Composition API hooks are stored in the instance
+    const compositionHooks = (instance as any)?.[hookName]
+    if (Array.isArray(compositionHooks)) {
+      compositionHooks.forEach(hook => {
+        if (typeof hook === 'function') {
+          hook()
+        }
+      })
+    }
+  } catch (error) {
+    if (__DEV__) {
+      warn(`Error calling ${hookName} hook: ${error}`)
+    }
+  }
+}
+
+/**
+ * Trigger lifecycle hooks on all matched route instances for a specific layer
+ */
+function callHooksOnLayer(
+  routes: RouteLocationNormalizedLoaded[],
+  layer: number,
+  hookName: 'activated' | 'deactivated'
+) {
+  if (layer >= routes.length || !routes[layer]) {
+    return
+  }
+
+  const route = routes[layer]
+
+  // Iterate through all matched route records for this layer
+  route.matched.forEach(record => {
+    // Call hooks on all component instances in this record
+    Object.values(record.instances).forEach(instance => {
+      if (instance) {
+        callLifecycleHook(instance, hookName)
+      }
+    })
+  })
 }
 
 export interface RouterViewDevtoolsContext
@@ -52,6 +117,10 @@ export const RouterViewImpl = /*#__PURE__*/ defineComponent({
       default: 'default',
     },
     route: Object as PropType<RouteLocationNormalizedLoaded>,
+    nextLayer: {
+      type: Boolean as PropType<boolean>,
+      default: false,
+    },
   },
 
   // Better compat for @vue/compat users
@@ -62,9 +131,58 @@ export const RouterViewImpl = /*#__PURE__*/ defineComponent({
     __DEV__ && warnDeprecatedUsage()
 
     const injectedRoute = inject(routerViewLocationKey)!
-    const routeToDisplay = computed<RouteLocationNormalizedLoaded>(
-      () => props.route || injectedRoute.value
-    )
+    const injectedLayer = inject(routerLayerKey, 0)
+    const injectedRoutes = inject(routerRoutesKey)
+
+    // Calculate the layer index: if nextLayer is true, use next layer, otherwise use current layer
+    const layerIndex = computed(() => {
+      const baseLayer =
+        typeof injectedLayer === 'number' ? injectedLayer : unref(injectedLayer)
+      return props.nextLayer ? baseLayer + 1 : baseLayer
+    })
+
+    // Get the route for this layer from the router's currentRoutes
+    const routeToDisplay = computed<RouteLocationNormalizedLoaded>(() => {
+      if (props.route) {
+        return props.route as RouteLocationNormalizedLoaded
+      }
+
+      // Access the routes array reactively (matching router-legacy: parent._routerRoot._routes)
+      const layer = layerIndex.value
+
+      // If injectedRoutes is available, use it (contains all layers)
+      if (injectedRoutes) {
+        const routes = injectedRoutes.value
+        // If layer exists in the array and is a valid route, use it
+        if (
+          layer < routes.length &&
+          routes[layer] &&
+          routes[layer].matched &&
+          routes[layer].matched.length > 0
+        ) {
+          return routes[layer]
+        }
+        // If layer doesn't exist or route is not loaded yet, return empty route for that layer
+        // This prevents rendering before the route is fully loaded
+        return START_LOCATION_NORMALIZED
+      }
+
+      // Fallback: if no injectedRoutes, use injectedRoute for layer 0 only
+      // This handles the case where routerRoutesKey is not provided (backward compatibility)
+      if (layer === 0) {
+        const route = injectedRoute.value
+        // Ensure the route is loaded (has matched routes)
+        if (route && route.matched && route.matched.length > 0) {
+          return route
+        }
+        // If route is not loaded yet, return empty route
+        return START_LOCATION_NORMALIZED
+      }
+
+      // For other layers when injectedRoutes is not available, return empty route
+      return START_LOCATION_NORMALIZED
+    })
+
     const injectedDepth = inject(viewDepthKey, 0)
     // The depth changes based on empty components option, which allows passthrough routes e.g. routes with children
     // that are used to reuse the `path` property
@@ -90,8 +208,32 @@ export const RouterViewImpl = /*#__PURE__*/ defineComponent({
     )
     provide(matchedRouteKey, matchedRouteRef)
     provide(routerViewLocationKey, routeToDisplay)
+    // Provide the layer index to child RouterViews
+    provide(routerLayerKey, layerIndex)
 
     const viewRef = ref<ComponentPublicInstance>()
+
+    // Watch for layer changes (only on layer 0 to avoid duplicate watchers)
+    // The system supports max 2 layers: layer 0 (main) and layer 1 (overlay)
+    // Using flush: 'pre' to trigger hooks BEFORE the component re-renders
+    if (injectedLayer === 0 && injectedRoutes) {
+      watch(
+        () => injectedRoutes.value.length,
+        (newLayerCount, oldLayerCount) => {
+          // Layer 1 was added (went from 1 to 2 layers)
+          if (oldLayerCount === 1 && newLayerCount === 2) {
+            // Deactivate layer 0 BEFORE layer 1 renders
+            callHooksOnLayer(injectedRoutes.value, 0, 'deactivated')
+          }
+          // Layer 1 was removed (went from 2 to 1 layers)
+          else if (oldLayerCount === 2 && newLayerCount === 1) {
+            // Reactivate layer 0 BEFORE re-render
+            callHooksOnLayer(injectedRoutes.value, 0, 'activated')
+          }
+        },
+        { flush: 'pre' }
+      )
+    }
 
     // watch at the same time the component instance, the route record we are
     // rendering, and the name
@@ -137,6 +279,15 @@ export const RouterViewImpl = /*#__PURE__*/ defineComponent({
 
     return () => {
       const route = routeToDisplay.value
+
+      // Guard: Ensure route is a valid route object (not a Promise or invalid)
+      if (!route || typeof route !== 'object' || !('matched' in route)) {
+        return normalizeSlot(slots.default, {
+          Component: null,
+          route: START_LOCATION_NORMALIZED,
+        })
+      }
+
       // we need the value at the time we render because when we unmount, we
       // navigated to a different location so the value is different
       const currentName = props.name
@@ -144,8 +295,22 @@ export const RouterViewImpl = /*#__PURE__*/ defineComponent({
       const ViewComponent =
         matchedRoute && matchedRoute.components![currentName]
 
-      if (!ViewComponent) {
-        return normalizeSlot(slots.default, { Component: ViewComponent, route })
+      // Guard against Promise components (async components that haven't resolved yet)
+      // Vue should handle this, but we check to avoid rendering "[Object Promise]"
+      if (
+        ViewComponent &&
+        typeof ViewComponent === 'object' &&
+        'then' in ViewComponent
+      ) {
+        // Component is still a Promise, return null or empty slot
+        return normalizeSlot(slots.default, { Component: null, route })
+      }
+
+      if (!ViewComponent || !matchedRoute) {
+        return normalizeSlot(slots.default, {
+          Component: ViewComponent || null,
+          route,
+        })
       }
 
       // props from route configuration

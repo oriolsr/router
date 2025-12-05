@@ -51,3 +51,23 @@ export const routeLocationKey = Symbol(
 export const routerViewLocationKey = Symbol(
   __DEV__ ? 'router view location' : ''
 ) as InjectionKey<Ref<RouteLocationNormalizedLoaded>>
+
+/**
+ * Allows overriding the router layer index. Used to determine which layer
+ * a RouterView should render.
+ *
+ * @internal
+ */
+export const routerLayerKey = Symbol(
+  __DEV__ ? 'router layer' : ''
+) as InjectionKey<Ref<number> | number>
+
+/**
+ * Provides access to all current routes (layers). Used by RouterView to
+ * access routes for different layers.
+ *
+ * @internal
+ */
+export const routerRoutesKey = Symbol(
+  __DEV__ ? 'router routes' : ''
+) as InjectionKey<Ref<RouteLocationNormalizedLoaded[]>>
