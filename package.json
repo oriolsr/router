@@ -1,5 +1,28 @@
 {
-  "name": "@vue/router-root",
+  "name": "vue-router",
+  "version": "4.6.3",
+  "main": "packages/router/index.js",
+  "module": "packages/router/dist/vue-router.mjs",
+  "types": "packages/router/dist/vue-router.d.mts",
+  "exports": {
+    ".": {
+      "types": "./packages/router/dist/vue-router.d.mts",
+      "node": {
+        "import": {
+          "production": "./packages/router/vue-router.node.mjs",
+          "development": "./packages/router/vue-router.node.mjs",
+          "default": "./packages/router/vue-router.node.mjs"
+        },
+        "require": {
+          "production": "./packages/router/dist/vue-router.prod.cjs",
+          "development": "./packages/router/dist/vue-router.cjs",
+          "default": "./packages/router/index.js"
+        }
+      },
+      "import": "./packages/router/dist/vue-router.mjs",
+      "require": "./packages/router/index.js"
+    }
+  },
   "private": true,
   "packageManager": "pnpm@10.18.2",
   "type": "module",
@@ -13,6 +36,7 @@
     "release": "node scripts/release.mjs",
     "size": "node scripts/check-size.mjs",
     "build": "pnpm run -r build",
+    "prepare": "pnpm --filter vue-router build",
     "docs": "pnpm run --filter ./packages/docs -r docs",
     "docs:api": "pnpm run --filter ./packages/docs -r docs:api",
     "docs:translation:compare": "pnpm run --filter ./packages/docs -r docs:translation:compare",

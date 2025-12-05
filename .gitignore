@@ -1,4 +1,5 @@
 dist
+!packages/router/dist
 node_modules
 coverage
 .nyc_output
